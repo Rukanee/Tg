@@ -1,0 +1,5 @@
+{
+  "name": "Solana Telegram Trading Bot & Admin",
+  "description": "A Telegram bot for trading Solana meme coins with an admin dashboard for wallet management.",
+  "requestFramePermissions": []
+}
