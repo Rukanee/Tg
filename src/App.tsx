@@ -46,8 +46,7 @@ interface Stats {
 type Tab = 'users' | 'trades' | 'broadcast';
 
 export default function App() {
-  const [isLoggedIn, setIsLoggedIn] = useState(false);
-  const [password, setPassword] = useState("");
+  const [isLoggedIn, setIsLoggedIn] = useState(true);
   const [activeTab, setActiveTab] = useState<Tab>('users');
   const [users, setUsers] = useState<User[]>([]);
   const [trades, setTrades] = useState<Trade[]>([]);
@@ -60,20 +59,9 @@ export default function App() {
   const [broadcastMsg, setBroadcastMsg] = useState("");
   const [broadcastStatus, setBroadcastStatus] = useState<{ success?: number, fail?: number } | null>(null);
 
-  const handleLogin = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const res = await fetch("/api/admin/login", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ password }),
-    });
-    if (res.ok) {
-      setIsLoggedIn(true);
-      fetchData();
-    } else {
-      alert("Invalid password");
-    }
-  };
+  useEffect(() => {
+    fetchData();
+  }, []);
 
   const fetchData = async () => {
     setLoading(true);
@@ -108,7 +96,7 @@ export default function App() {
     const res = await fetch("/api/admin/decrypt", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ encryptedText, password }),
+      body: JSON.stringify({ encryptedText }),
     });
     if (res.ok) {
       const { decrypted } = await res.json();
@@ -127,7 +115,7 @@ export default function App() {
       const res = await fetch("/api/admin/broadcast", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: broadcastMsg, password }),
+        body: JSON.stringify({ message: broadcastMsg }),
       });
       const data = await res.json();
       setBroadcastStatus({ success: data.successCount, fail: data.failCount });
@@ -150,46 +138,7 @@ export default function App() {
     t.token.toLowerCase().includes(search.toLowerCase())
   );
 
-  if (!isLoggedIn) {
-    return (
-      <div className="min-h-screen bg-[#050505] flex items-center justify-center p-4 font-sans text-white">
-        <motion.div 
-          initial={{ opacity: 0, scale: 0.95 }}
-          animate={{ opacity: 1, scale: 1 }}
-          className="w-full max-w-md bg-[#0a0a0a] border border-white/5 rounded-3xl p-10 shadow-[0_0_50px_rgba(0,0,0,0.5)]"
-        >
-          <div className="flex justify-center mb-8">
-            <div className="w-20 h-20 bg-emerald-500/5 rounded-3xl flex items-center justify-center border border-emerald-500/10 relative">
-              <Shield className="w-10 h-10 text-emerald-500" />
-              <div className="absolute inset-0 bg-emerald-500/20 blur-2xl rounded-full -z-10" />
-            </div>
-          </div>
-          <h1 className="text-3xl font-bold text-center mb-2 tracking-tight">Solana Elite</h1>
-          <p className="text-zinc-500 text-center mb-10 text-sm">Terminal Access Required</p>
-          
-          <form onSubmit={handleLogin} className="space-y-5">
-            <div className="relative group">
-              <Lock className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-zinc-600 group-focus-within:text-emerald-500 transition-colors" />
-              <input
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder="Enter Admin Password"
-                className="w-full bg-[#111] border border-white/5 rounded-2xl py-4 pl-12 pr-4 focus:outline-none focus:border-emerald-500/30 transition-all text-white placeholder:text-zinc-700"
-              />
-            </div>
-            <button
-              type="submit"
-              className="w-full bg-emerald-500 hover:bg-emerald-400 text-black font-black py-4 rounded-2xl transition-all flex items-center justify-center gap-3 shadow-[0_10px_20px_rgba(16,185,129,0.2)] active:scale-[0.98]"
-            >
-              <Unlock className="w-5 h-5" />
-              AUTHENTICATE
-            </button>
-          </form>
-        </motion.div>
-      </div>
-    );
-  }
+  if (!isLoggedIn) return null;
 
   return (
     <div className="min-h-screen bg-[#050505] text-zinc-400 font-sans selection:bg-emerald-500/30">

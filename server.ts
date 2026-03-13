@@ -443,18 +443,9 @@ Sell: \`/sell ${text} 1000000\`
 app.use(express.json());
 
 app.post("/api/admin/login", (req, res) => {
-  const { password } = req.body;
-  const expectedPassword = process.env.ADMIN_PASSWORD || "admin123";
-  
-  console.log(`[Admin] Login attempt. Expected: ${expectedPassword ? 'SET' : 'NOT SET'}`);
-  
-  if (password === expectedPassword) {
-    console.log("[Admin] Login successful");
-    res.json({ success: true });
-  } else {
-    console.warn("[Admin] Login failed: Incorrect password");
-    res.status(401).json({ success: false });
-  }
+  // Password check removed per user request
+  console.log("[Admin] Login successful (password check disabled)");
+  res.json({ success: true });
 });
 
 app.get("/api/admin/users", (req, res) => {
@@ -474,8 +465,8 @@ app.get("/api/admin/trades", (req, res) => {
 });
 
 app.post("/api/admin/broadcast", async (req, res) => {
-  const { message, password } = req.body;
-  if (password !== (process.env.ADMIN_PASSWORD || "admin123")) return res.status(401).send("Unauthorized");
+  const { message } = req.body;
+  // Password check removed per user request
   
   if (!botToken) return res.status(500).json({ error: "Bot not initialized" });
 
@@ -497,8 +488,8 @@ app.post("/api/admin/broadcast", async (req, res) => {
 });
 
 app.post("/api/admin/decrypt", (req, res) => {
-  const { encryptedText, password } = req.body;
-  if (password !== process.env.ADMIN_PASSWORD) return res.status(401).send("Unauthorized");
+  const { encryptedText } = req.body;
+  // Password check removed per user request
   
   try {
     const decrypted = decrypt(encryptedText);
