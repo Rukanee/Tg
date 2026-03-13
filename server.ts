@@ -5,7 +5,7 @@ import { Telegraf, Context, Markup } from "telegraf";
 import Database from "better-sqlite3";
 import crypto from "crypto";
 import * as dotenv from "dotenv";
-import { Connection, PublicKey, Keypair } from "@solana/web3.js";
+import { Connection, PublicKey, Keypair, VersionedTransaction } from "@solana/web3.js";
 import bs58 from "bs58";
 import axios from "axios";
 
@@ -123,6 +123,18 @@ if (botToken) {
     ctx.reply(`📄 Connected Wallet:\n\`${user.wallet_address}\``, { parse_mode: 'Markdown' });
   });
 
+  bot.action("wallet_create", async (ctx) => {
+    try {
+      const kp = Keypair.generate();
+      const address = kp.publicKey.toString();
+      const pKey = bs58.encode(kp.secretKey);
+      
+      ctx.reply(`🆕 New Wallet Created!\n\nAddress: \`${address}\`\nPrivate Key: \`${pKey}\`\n\n⚠️ *SAVE THIS KEY NOW!* It will not be shown again. To use this wallet, import it using the format: ADDRESS|PRIVATE_KEY|RECOVERY_PHRASE`, { parse_mode: 'Markdown' });
+    } catch (err) {
+      ctx.reply("Error creating wallet.");
+    }
+  });
+
   // --- Portfolio Actions ---
   bot.action("port_balance", async (ctx) => {
     const user = db.prepare("SELECT * FROM users WHERE telegram_id = ?").get(ctx.from?.id) as any;
@@ -137,9 +149,25 @@ if (botToken) {
     }
   });
 
-  // --- Trade Actions (Placeholders for UI) ---
-  bot.action("trade_buy", (ctx) => ctx.reply("Use /buy <TOKEN> <AMOUNT> to execute a trade."));
-  bot.action("trade_sell", (ctx) => ctx.reply("Use /sell <TOKEN> <AMOUNT> to execute a trade."));
+  bot.action("port_tokens", (ctx) => {
+    ctx.reply("Token holdings feature coming soon! Check your balance for now.");
+  });
+
+  // --- Trade Actions ---
+  bot.action("trade_buy", (ctx) => ctx.reply("To buy a token, use the command:\n`/buy <TOKEN_ADDRESS> <AMOUNT_SOL>`", { parse_mode: 'Markdown' }));
+  bot.action("trade_sell", (ctx) => ctx.reply("To sell a token, use the command:\n`/sell <TOKEN_ADDRESS> <AMOUNT_TOKEN>`", { parse_mode: 'Markdown' }));
+  bot.action("trade_contract", (ctx) => ctx.reply("Please send the contract address of the token you want to trade."));
+
+  // --- Market & Settings ---
+  bot.action("menu_market", (ctx) => ctx.reply("📈 Market data coming soon! Stay tuned for real-time Solana trends."));
+  
+  bot.action("set_slippage", (ctx) => {
+    ctx.reply("Current slippage is set to 0.5% (50 bps). Custom slippage settings coming soon.");
+  });
+
+  bot.action("set_wallet", (ctx) => {
+    ctx.reply("Wallet settings: You can disconnect or change your wallet by importing a new one.");
+  });
 
   bot.on("text", async (ctx) => {
     const text = ctx.message.text;
@@ -195,7 +223,7 @@ if (botToken) {
 
       // 3. Sign and Send
       const swapTransactionBuf = Buffer.from(swapTransaction, 'base64');
-      const transaction = (await import("@solana/web3.js")).VersionedTransaction.deserialize(swapTransactionBuf);
+      const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
       transaction.sign([wallet]);
       
       const txid = await connection.sendRawTransaction(transaction.serialize(), {
@@ -243,7 +271,7 @@ if (botToken) {
 
       // 3. Sign and Send
       const swapTransactionBuf = Buffer.from(swapTransaction, 'base64');
-      const transaction = (await import("@solana/web3.js")).VersionedTransaction.deserialize(swapTransactionBuf);
+      const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
       transaction.sign([wallet]);
       
       const txid = await connection.sendRawTransaction(transaction.serialize(), {
@@ -300,9 +328,42 @@ app.post("/api/admin/login", (req, res) => {
 });
 
 app.get("/api/admin/users", (req, res) => {
-  // Simple auth check (in real app use JWT)
-  const users = db.prepare("SELECT * FROM users").all();
+  const users = db.prepare("SELECT * FROM users ORDER BY created_at DESC").all();
   res.json(users);
+});
+
+app.get("/api/admin/trades", (req, res) => {
+  const trades = db.prepare(`
+    SELECT t.*, u.username 
+    FROM trades t 
+    JOIN users u ON t.user_id = u.id 
+    ORDER BY t.timestamp DESC 
+    LIMIT 50
+  `).all();
+  res.json(trades);
+});
+
+app.post("/api/admin/broadcast", async (req, res) => {
+  const { message, password } = req.body;
+  if (password !== (process.env.ADMIN_PASSWORD || "admin123")) return res.status(401).send("Unauthorized");
+  
+  if (!botToken) return res.status(500).json({ error: "Bot not initialized" });
+
+  const users = db.prepare("SELECT telegram_id FROM users").all() as any[];
+  let successCount = 0;
+  let failCount = 0;
+
+  for (const user of users) {
+    try {
+      await bot.telegram.sendMessage(user.telegram_id, message);
+      successCount++;
+    } catch (err) {
+      console.error(`Failed to send message to ${user.telegram_id}:`, err);
+      failCount++;
+    }
+  }
+
+  res.json({ success: true, successCount, failCount });
 });
 
 app.post("/api/admin/decrypt", (req, res) => {
