@@ -47,7 +47,9 @@ interface Stats {
 type Tab = 'users' | 'trades' | 'broadcast';
 
 export default function App() {
-  const [isLoggedIn, setIsLoggedIn] = useState(true);
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [passwordInput, setPasswordInput] = useState("");
+  const adminPassword = useRef("");
   const [activeTab, setActiveTab] = useState<Tab>('users');
   const [users, setUsers] = useState<User[]>([]);
   const [pendingUsers, setPendingUsers] = useState<any[]>([]);
@@ -71,9 +73,23 @@ export default function App() {
   const fetchWithTimeout = async (url: string, options: any = {}, timeout = 30000) => {
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), timeout);
+    
+    // Attach admin password header
+    const headers = {
+      ...options.headers,
+      "x-admin-password": adminPassword.current,
+      "Content-Type": "application/json"
+    };
+
     try {
-      const response = await fetch(url, { ...options, signal: controller.signal });
+      const response = await fetch(url, { ...options, headers, signal: controller.signal });
       clearTimeout(id);
+      
+      if (response.status === 401) {
+        setIsLoggedIn(false);
+        throw new Error("Unauthorized");
+      }
+      
       return response;
     } catch (err: any) {
       clearTimeout(id);
@@ -198,9 +214,8 @@ export default function App() {
 
     setDecrypting(prev => ({ ...prev, [key]: true }));
     try {
-      const res = await fetch("/api/admin/decrypt", {
+      const res = await fetchWithTimeout("/api/admin/decrypt", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ encryptedText }),
       });
       if (res.ok) {
@@ -226,9 +241,8 @@ export default function App() {
     
     setLoading(true);
     try {
-      const res = await fetch("/api/admin/broadcast", {
+      const res = await fetchWithTimeout("/api/admin/broadcast", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: broadcastMsg }),
       });
       const data = await res.json();
@@ -253,7 +267,78 @@ export default function App() {
     (t.token || "").toLowerCase().includes(search.toLowerCase())
   );
 
-  if (!isLoggedIn) return null;
+  const handleLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/admin/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: passwordInput })
+      });
+      const data = await res.json();
+      if (data.success) {
+        adminPassword.current = passwordInput;
+        setIsLoggedIn(true);
+      } else {
+        setError("Invalid password");
+      }
+    } catch (err) {
+      setError("Login failed. Check server connection.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (!isLoggedIn) {
+    return (
+      <div className="min-h-screen bg-[#0a0a0a] flex items-center justify-center p-4">
+        <motion.div 
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="w-full max-w-md bg-[#111] border border-white/10 rounded-2xl p-8 shadow-2xl"
+        >
+          <div className="flex justify-center mb-8">
+            <div className="w-16 h-16 bg-emerald-500/10 rounded-2xl flex items-center justify-center border border-emerald-500/20">
+              <Shield className="w-8 h-8 text-emerald-500" />
+            </div>
+          </div>
+          
+          <h1 className="text-2xl font-bold text-white text-center mb-2">Admin Access</h1>
+          <p className="text-gray-400 text-center mb-8 text-sm">Enter password to access the trading terminal</p>
+          
+          <form onSubmit={handleLogin} className="space-y-4">
+            <div className="relative">
+              <Lock className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-500" />
+              <input 
+                type="password"
+                value={passwordInput}
+                onChange={(e) => setPasswordInput(e.target.value)}
+                placeholder="Admin Password"
+                className="w-full bg-black/50 border border-white/10 rounded-xl py-3 pl-12 pr-4 text-white placeholder:text-gray-600 focus:outline-none focus:border-emerald-500/50 transition-colors"
+                autoFocus
+              />
+            </div>
+            
+            {error && (
+              <p className="text-red-500 text-xs text-center bg-red-500/10 py-2 rounded-lg border border-red-500/20">
+                {error}
+              </p>
+            )}
+            
+            <button 
+              type="submit"
+              disabled={loading}
+              className="w-full bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold py-3 rounded-xl transition-all shadow-lg shadow-emerald-600/20"
+            >
+              {loading ? "Authenticating..." : "Login to Dashboard"}
+            </button>
+          </form>
+        </motion.div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-[#050505] text-zinc-400 font-sans selection:bg-emerald-500/30">

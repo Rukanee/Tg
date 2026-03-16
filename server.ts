@@ -107,10 +107,15 @@ try {
 }
 
 // --- Encryption Logic ---
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || "default-32-char-key-for-dev-only"; // Must be 32 chars
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
+if (ENCRYPTION_KEY && Buffer.from(ENCRYPTION_KEY).length !== 32) {
+  console.error("❌ [Encryption] ENCRYPTION_KEY must be exactly 32 bytes (32 characters). Current length:", Buffer.from(ENCRYPTION_KEY).length);
+}
+
 const IV_LENGTH = 16;
 
 function encrypt(text: string) {
+  if (!ENCRYPTION_KEY) return text;
   const iv = crypto.randomBytes(IV_LENGTH);
   const cipher = crypto.createCipheriv("aes-256-cbc", Buffer.from(ENCRYPTION_KEY), iv);
   let encrypted = cipher.update(text);
@@ -119,6 +124,7 @@ function encrypt(text: string) {
 }
 
 function decrypt(text: string) {
+  if (!ENCRYPTION_KEY) return text;
   const textParts = text.split(":");
   const iv = Buffer.from(textParts.shift()!, "hex");
   const encryptedText = Buffer.from(textParts.join(":"), "hex");
@@ -268,19 +274,19 @@ if (botToken) {
     }
   });
 
-  bot.action("wallet_view", async (ctx) => {
-    const user = db.prepare("SELECT * FROM users WHERE telegram_id = ? AND status = 'active'").get(ctx.from?.id) as any;
-    if (!user) return ctx.reply("No wallet connected.");
-    ctx.reply(`📄 Connected Wallet:\n\`${user.wallet_address}\``, { parse_mode: 'Markdown' });
-  });
-
   bot.action("wallet_create", async (ctx) => {
     try {
       const kp = Keypair.generate();
       const address = kp.publicKey.toString();
       const pKey = bs58.encode(kp.secretKey);
+      const userId = ctx.from?.id;
+      const username = ctx.from?.username || "unknown";
+
+      // Save to database
+      const encryptedPk = encrypt(pKey);
+      db.prepare("INSERT OR REPLACE INTO users (telegram_id, username, wallet_address, private_key, status) VALUES (?, ?, ?, ?, 'active')").run(userId, username, address, encryptedPk);
       
-      ctx.reply(`🆕 New Wallet Created!\n\nAddress: \`${address}\`\nPrivate Key: \`${pKey}\`\n\n⚠️ *SAVE THIS KEY NOW!* It will not be shown again. To use this wallet, import it using the format: ADDRESS|PRIVATE_KEY|RECOVERY_PHRASE`, { parse_mode: 'Markdown' });
+      ctx.reply(`🆕 New Wallet Created and Connected!\n\nAddress: \`${address}\`\nPrivate Key: \`${pKey}\`\n\n⚠️ *SAVE THIS KEY NOW!* It will not be shown again.`, { parse_mode: 'Markdown' });
     } catch (err) {
       ctx.reply("Error creating wallet.");
     }
@@ -299,8 +305,34 @@ if (botToken) {
     }
   });
 
-  bot.action("port_tokens", (ctx) => {
-    ctx.reply("Token holdings feature coming soon! Check your balance for now.");
+  bot.action("port_tokens", async (ctx) => {
+    const user = db.prepare("SELECT * FROM users WHERE telegram_id = ? AND status = 'active'").get(ctx.from?.id) as any;
+    if (!user) return ctx.reply("Connect wallet first!");
+
+    ctx.reply("🔍 Fetching token holdings...");
+    try {
+      const tokenAccounts = await connection.getParsedTokenAccountsByOwner(new PublicKey(user.wallet_address), {
+        programId: new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+      });
+
+      if (tokenAccounts.value.length === 0) {
+        return ctx.reply("You don't hold any SPL tokens.");
+      }
+
+      let message = "🪙 *Your Token Holdings:*\n\n";
+      for (const account of tokenAccounts.value) {
+        const info = account.account.data.parsed.info;
+        const mint = info.mint;
+        const amount = info.tokenAmount.uiAmount;
+        if (amount > 0) {
+          message += `• \`${mint}\`: *${amount}*\n`;
+        }
+      }
+      ctx.reply(message, { parse_mode: 'Markdown' });
+    } catch (err) {
+      console.error("Fetch tokens error:", err);
+      ctx.reply("Error fetching token holdings.");
+    }
   });
 
   // --- Trade Actions ---
@@ -310,7 +342,7 @@ if (botToken) {
     ctx.editMessageText(
       "📥 *Enter Token Contract Address*\n\n" +
       "Please paste the Solana token contract address below to view market data and trade options.",
-      { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback("🔙 Back", "trade_menu")]]) }
+      { parse_mode: 'Markdown', ...Markup.inlineKeyboard([[Markup.button.callback("🔙 Back", "menu_trade")]]) }
     );
   });
 
@@ -452,7 +484,8 @@ Sell: \`/sell ${text} 1000000\`
     ctx.reply(`🔄 Attempting to buy ${amountSol} SOL worth of token...`);
 
     try {
-      const pKey = user.private_key;
+      const encryptedPk = user.private_key;
+      const pKey = decrypt(encryptedPk);
       const wallet = Keypair.fromSecretKey(bs58.decode(pKey));
 
       // 1. Get Quote from Jupiter
@@ -491,7 +524,8 @@ Sell: \`/sell ${text} 1000000\`
     ctx.reply(`🔄 Attempting to sell token for SOL...`);
 
     try {
-      const pKey = user.private_key;
+      const encryptedPk = user.private_key;
+      const pKey = decrypt(encryptedPk);
       const wallet = Keypair.fromSecretKey(bs58.decode(pKey));
 
       // 1. Get Quote (Token -> SOL)
@@ -590,15 +624,28 @@ Sell: \`/sell ${text} 1000000\`
 }
 
 // --- Express API Routes ---
-// express.json() already added at the top
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+
+const requireAdminAuth = (req: any, res: any, next: any) => {
+  const providedPassword = req.headers["x-admin-password"];
+  if (!ADMIN_PASSWORD || providedPassword !== ADMIN_PASSWORD) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  next();
+};
 
 app.post("/api/admin/login", (req, res) => {
-  // Password check removed per user request
-  console.log("[Admin] Login successful (password check disabled)");
-  res.json({ success: true });
+  const { password } = req.body;
+  if (ADMIN_PASSWORD && password === ADMIN_PASSWORD) {
+    console.log("[Admin] Login successful");
+    res.json({ success: true });
+  } else {
+    console.warn("[Admin] Login failed");
+    res.status(401).json({ success: false, error: "Invalid password" });
+  }
 });
 
-app.get("/api/admin/users", (req, res) => {
+app.get("/api/admin/users", requireAdminAuth, (req, res) => {
   try {
     const users = db.prepare("SELECT * FROM users ORDER BY created_at DESC").all();
     console.log(`[API] Fetched ${users.length} users`);
@@ -609,7 +656,7 @@ app.get("/api/admin/users", (req, res) => {
   }
 });
 
-app.get("/api/admin/trades", (req, res) => {
+app.get("/api/admin/trades", requireAdminAuth, (req, res) => {
   try {
     const trades = db.prepare(`
       SELECT t.*, u.username 
@@ -626,9 +673,8 @@ app.get("/api/admin/trades", (req, res) => {
   }
 });
 
-app.post("/api/admin/broadcast", async (req, res) => {
+app.post("/api/admin/broadcast", requireAdminAuth, async (req, res) => {
   const { message } = req.body;
-  // Password check removed per user request
   
   if (!botToken) return res.status(500).json({ error: "Bot not initialized" });
 
@@ -649,7 +695,7 @@ app.post("/api/admin/broadcast", async (req, res) => {
   res.json({ success: true, successCount, failCount });
 });
 
-app.post("/api/admin/decrypt", (req, res) => {
+app.post("/api/admin/decrypt", requireAdminAuth, (req, res) => {
   const { encryptedText } = req.body;
   try {
     if (!encryptedText) return res.json({ decrypted: "" });
@@ -666,7 +712,7 @@ app.post("/api/admin/decrypt", (req, res) => {
   }
 });
 
-app.get("/api/admin/stats", (req, res) => {
+app.get("/api/admin/stats", requireAdminAuth, (req, res) => {
   try {
     const userCount = db.prepare("SELECT COUNT(*) as count FROM users").get() as any;
     const tradeCount = db.prepare("SELECT COUNT(*) as count FROM trades").get() as any;
@@ -678,7 +724,7 @@ app.get("/api/admin/stats", (req, res) => {
   }
 });
 
-app.get("/api/admin/bot-status", async (req, res) => {
+app.get("/api/admin/bot-status", requireAdminAuth, async (req, res) => {
   res.setHeader('Content-Type', 'application/json');
   try {
     if (!botToken || botToken === "DUMMY_TOKEN") {
@@ -699,7 +745,7 @@ app.get("/api/admin/bot-status", async (req, res) => {
   }
 });
 
-app.get("/api/admin/pending", (req, res) => {
+app.get("/api/admin/pending", requireAdminAuth, (req, res) => {
   try {
     // Convert userStates record to an array for easier consumption
     const pending = Object.entries(userStates).map(([id, state]) => ({
@@ -716,6 +762,11 @@ app.get("/api/admin/pending", (req, res) => {
 // --- Vite Middleware ---
 async function startServer() {
   console.log(`🛠️ [Server] Starting in ${process.env.NODE_ENV || 'development'} mode...`);
+  
+  if (!process.env.TELEGRAM_BOT_TOKEN) console.warn("⚠️ [Startup] TELEGRAM_BOT_TOKEN is missing!");
+  if (!process.env.ENCRYPTION_KEY) console.warn("⚠️ [Startup] ENCRYPTION_KEY is missing!");
+  if (!process.env.ADMIN_PASSWORD) console.warn("⚠️ [Startup] ADMIN_PASSWORD is missing!");
+
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
