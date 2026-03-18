@@ -105,13 +105,13 @@ export default function App() {
       // Run health check first
       const isHealthy = await checkServerHealth();
       
-      // Only proceed if server is online
-      if (isHealthy) {
+      // Only proceed with data fetch if server is online AND user is logged in
+      if (isHealthy && isLoggedIn) {
         await Promise.all([
           fetchData(),
           checkBotStatus()
         ]);
-      } else {
+      } else if (!isHealthy) {
         console.warn("Server is offline, skipping data fetch");
         setLoading(false);
       }
@@ -121,7 +121,7 @@ export default function App() {
 
     const interval = setInterval(refresh, 15000); // 15s refresh
     return () => clearInterval(interval);
-  }, []);
+  }, [isLoggedIn]);
 
   const isCheckingHealth = useRef(false);
   const isCheckingBot = useRef(false);
@@ -267,26 +267,20 @@ export default function App() {
     (t.token || "").toLowerCase().includes(search.toLowerCase())
   );
 
-  const handleLogin = async (e: React.FormEvent) => {
+  const handleLogin = (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
     setError(null);
-    try {
-      const res = await fetch("/api/admin/login", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ password: passwordInput })
-      });
-      const data = await res.json();
-      if (data.success) {
-        adminPassword.current = passwordInput;
-        setIsLoggedIn(true);
-      } else {
-        setError("Invalid password");
-      }
-    } catch (err) {
-      setError("Login failed. Check server connection.");
-    } finally {
+    
+    // Frontend-only password check using Vite environment variable
+    const ENV_PASSWORD = import.meta.env.VITE_DASHBOARD_PASSWORD;
+    
+    if (passwordInput === ENV_PASSWORD) {
+      adminPassword.current = passwordInput;
+      setIsLoggedIn(true);
+      setLoading(false);
+    } else {
+      setError("Invalid password");
       setLoading(false);
     }
   };
