@@ -624,7 +624,7 @@ Sell: \`/sell ${text} 1000000\`
 }
 
 // --- Express API Routes ---
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin-password";
 
 const requireAdminAuth = (req: any, res: any, next: any) => {
   const providedPassword = req.headers["x-admin-password"];

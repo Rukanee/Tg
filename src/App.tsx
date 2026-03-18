@@ -86,8 +86,7 @@ export default function App() {
       clearTimeout(id);
       
       if (response.status === 401) {
-        setIsLoggedIn(false);
-        throw new Error("Unauthorized");
+        throw new Error("Unauthorized: Backend password mismatch");
       }
       
       return response;
@@ -195,7 +194,11 @@ export default function App() {
       console.error("[Fetch Error]", err);
       // Only show error if we don't have any data yet
       if (users.length === 0) {
-        setError(err.name === 'AbortError' ? "Request timed out. Server might be busy." : "Connection lost. Retrying...");
+        if (err.message?.includes("Unauthorized")) {
+          setError("Backend password mismatch. Please check your ADMIN_PASSWORD setting.");
+        } else {
+          setError(err.name === 'AbortError' ? "Request timed out. Server might be busy." : "Connection lost. Retrying...");
+        }
       }
     } finally {
       setLoading(false);
@@ -273,7 +276,8 @@ export default function App() {
     setError(null);
     
     // Frontend-only password check using Vite environment variable
-    const ENV_PASSWORD = import.meta.env.VITE_DASHBOARD_PASSWORD;
+    // Fallback to "admin-password" if the environment variable is not set
+    const ENV_PASSWORD = import.meta.env.VITE_DASHBOARD_PASSWORD || "admin-password";
     
     if (passwordInput === ENV_PASSWORD) {
       adminPassword.current = passwordInput;
