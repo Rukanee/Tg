@@ -70,6 +70,8 @@ export default function App() {
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const isFetching = useRef(false);
 
+  const API_BASE = import.meta.env.VITE_API_URL || "";
+
   const fetchWithTimeout = async (url: string, options: any = {}, timeout = 30000) => {
     const controller = new AbortController();
     const id = setTimeout(() => controller.abort(), timeout);
@@ -82,7 +84,7 @@ export default function App() {
     };
 
     try {
-      const response = await fetch(url, { ...options, headers, signal: controller.signal });
+      const response = await fetch(`${API_BASE}${url}`, { ...options, headers, signal: controller.signal });
       clearTimeout(id);
       
       if (response.status === 401) {
