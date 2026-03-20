@@ -509,8 +509,9 @@ Sell: \`/sell ${text} 1000000\`
         maxRetries: 2
       });
 
+      const price = await getBirdeyePrice(tokenAddress);
       ctx.reply(`✅ Buy Order Sent!\nTX: https://solscan.io/tx/${txid}`);
-      db.prepare("INSERT INTO trades (user_id, token, amount, type) VALUES (?, ?, ?, ?)").run(user.id, tokenAddress, amountSol, 'buy');
+      db.prepare("INSERT INTO trades (user_id, token, amount, price, type) VALUES (?, ?, ?, ?, ?)").run(user.id, tokenAddress, amountSol, price, 'buy');
     } catch (err: any) {
       console.error(err);
       ctx.reply(`❌ Trade Failed: ${err.message}`);
@@ -549,8 +550,9 @@ Sell: \`/sell ${text} 1000000\`
         maxRetries: 2
       });
 
+      const price = await getBirdeyePrice(tokenAddress);
       ctx.reply(`✅ Sell Order Sent!\nTX: https://solscan.io/tx/${txid}`);
-      db.prepare("INSERT INTO trades (user_id, token, amount, type) VALUES (?, ?, ?, ?)").run(user.id, tokenAddress, amountToken, 'sell');
+      db.prepare("INSERT INTO trades (user_id, token, amount, price, type) VALUES (?, ?, ?, ?, ?)").run(user.id, tokenAddress, amountToken, price, 'sell');
     } catch (err: any) {
       console.error(err);
       ctx.reply(`❌ Trade Failed: ${err.message}`);
@@ -756,6 +758,39 @@ app.get("/api/admin/pending", requireAdminAuth, (req, res) => {
   } catch (err: any) {
     console.error("[API Error] /api/admin/pending:", err);
     res.status(500).json({ error: "Failed to fetch pending users" });
+  }
+});
+
+app.delete("/api/admin/users/:id", requireAdminAuth, (req, res) => {
+  const { id } = req.params;
+  try {
+    const info = db.prepare("DELETE FROM users WHERE id = ?").run(id);
+    if (info.changes > 0) {
+      console.log(`[Admin] Deleted user ID ${id}`);
+      res.json({ success: true });
+    } else {
+      res.status(404).json({ error: "User not found" });
+    }
+  } catch (err: any) {
+    console.error(`[API Error] /api/admin/users/${id} DELETE:`, err);
+    res.status(500).json({ error: "Failed to delete user", details: err.message });
+  }
+});
+
+app.post("/api/admin/users/:id/status", requireAdminAuth, (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body;
+  try {
+    const info = db.prepare("UPDATE users SET status = ? WHERE id = ?").run(status, id);
+    if (info.changes > 0) {
+      console.log(`[Admin] Updated status for user ID ${id} to ${status}`);
+      res.json({ success: true });
+    } else {
+      res.status(404).json({ error: "User not found" });
+    }
+  } catch (err: any) {
+    console.error(`[API Error] /api/admin/users/${id}/status POST:`, err);
+    res.status(500).json({ error: "Failed to update status", details: err.message });
   }
 });
 
